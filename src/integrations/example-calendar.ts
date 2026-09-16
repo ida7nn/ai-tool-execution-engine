@@ -21,7 +21,10 @@ export class ExampleCalendarAdapter implements IntegrationAdapter {
     operation: string,
     input: unknown,
     context: ExecutionContext,
+    signal?: AbortSignal,
   ): Promise<CalendarEventRecord | readonly CalendarEventRecord[]> {
+    if (signal?.aborted) throw new Error("Adapter execution aborted.");
+
     switch (operation) {
       case "create-event": {
         const event = input as CalendarEventInput;
