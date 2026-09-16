@@ -8,7 +8,7 @@ A production-oriented TypeScript engineering sample demonstrating how an AI appl
 
 When an AI agent can do more than generate text, the application needs a reliable execution boundary between **what the model wants to do** and **what the platform is actually allowed to do**.
 
-This sample focuses on that boundary: typed tools, tenant isolation, explicit permissions, input validation, idempotency, integration adapters, resilience controls, tenant rate limiting, structured audit events, metrics, and automated verification.
+This sample focuses on that boundary: typed tools, tenant isolation, explicit permissions, input validation, idempotency, integration adapters, resilience controls, tenant rate limiting, circuit breaking, structured audit events, metrics, and automated verification.
 
 ## Architecture
 
@@ -25,13 +25,13 @@ This sample focuses on that boundary: typed tools, tenant isolation, explicit pe
  |   Tool Executor   |------>| Audit Sink       |
  +---------+---------+       +------------------+
            |
-     +-----+------+----------------+
-     |            |                |
-     v            v                v
- Permissions   Rate Limit     Resilience
- + Policy      per Tenant     Timeout/Retry
-     |            |                |
-     +------------+----------------+
+     +-----+------+--------------------------+
+     |            |             |            |
+     v            v             v            v
+ Permissions   Rate Limit   Resilience   Circuit Breaker
+ + Policy      per Tenant   Timeout/Retry  per Tool
+     |            |             |            |
+     +------------+-------------+------------+
                   |
                   v
            Input Validation
@@ -57,7 +57,7 @@ Tools declare permissions such as `calendar.read` and `calendar.write`. Authoriz
 
 ### 3. Typed tool contracts
 
-Tools expose a typed input validator and typed output contract while the executor remains independent of any specific LLM provider.
+Tools expose a typed input validator and typed output contract while the executor remains independent of any specific LLM provider. Tool execution also accepts an optional `AbortSignal` so integrations can cooperate with cancellation.
 
 ### 4. Strict boundary validation
 
@@ -73,15 +73,19 @@ Successful results are cached by a tenant-scoped idempotency key. Concurrent req
 
 ### 7. Resilience at the provider boundary
 
-Provider operations can be protected with bounded timeouts and exponential-backoff retries. Authorization and validation errors are never retried, preventing retries from masking policy failures or malformed input.
+Provider operations can be protected with bounded timeouts and exponential-backoff retries. Authorization, validation, and timeout errors are not retried by default. A `shouldRetry` policy hook allows provider-specific classification when a production integration knows which errors are transient. Timeout handling also aborts the execution signal so cooperative adapters can stop work rather than merely timing out the caller.
 
-### 8. Tenant rate limiting
+### 8. Circuit breaking
+
+A per-tool circuit breaker prevents repeated calls to a failing provider after a configurable failure threshold. After a reset interval, one half-open probe is allowed to test recovery. Successful execution closes the circuit; denied policy failures do not count as provider failures.
+
+### 9. Tenant rate limiting
 
 A lightweight token-window limiter can cap execution requests per tenant. The limiter is intentionally injected behind the executor so production deployments can replace it with a distributed implementation without changing tool contracts.
 
-### 9. Observability without data leakage
+### 10. Observability without data leakage
 
-The executor emits structured lifecycle events containing execution metadata rather than raw inputs or customer payloads. A metrics sink records tool, outcome, duration, and configured attempt budget for operational instrumentation.
+The executor emits structured lifecycle events containing execution metadata rather than raw inputs or customer payloads. A metrics sink records tool, outcome, duration, and the **actual number of attempts**, rather than only the configured retry budget.
 
 The sample keeps state in memory deliberately. Production deployments should use durable idempotency storage, distributed rate limiting/coordination, and durable telemetry infrastructure.
 
@@ -102,9 +106,10 @@ The second tool is intentionally read-only. It demonstrates that permissions are
 4. Executor resolves the tool from the registry.
 5. Executor checks required permissions.
 6. Tool validates untrusted input.
-7. Provider execution is optionally protected by timeout/retry policy.
-8. A typed result is returned.
-9. Audit events and metrics capture the lifecycle.
+7. Circuit breaker checks provider health.
+8. Provider execution is optionally protected by timeout/retry policy.
+9. A typed result is returned.
+10. Audit events and metrics capture the lifecycle.
 
 ## Project structure
 
@@ -118,9 +123,10 @@ src/
 │   └── permissions.ts           # Tenant and permission enforcement
 ├── core/
 │   ├── errors.ts                # Typed boundary errors
+│   ├── circuit-breaker.ts       # Per-tool provider circuit breaker
 │   ├── observability.ts         # Metrics sink and in-memory implementation
 │   ├── rate-limiter.ts          # Tenant-scoped request limiter
-│   └── resilience.ts            # Timeout and retry policy
+│   └── resilience.ts            # Timeout, cancellation and retry policy
 ├── integrations/
 │   ├── integration.ts           # Provider adapter contract
 │   └── example-calendar.ts      # Provider-free, tenant-scoped adapter
@@ -133,12 +139,13 @@ src/
 
 tests/
 ├── tool-executor.test.ts        # Security, validation and concurrency behaviour
-└── phase3.test.ts               # Resilience, rate limiting and metrics
+├── phase3.test.ts               # Resilience, rate limiting and metrics
+└── phase4.test.ts               # Retry classification, cancellation and circuit breaking
 ```
 
 ## Testing
 
-The suite covers authorized execution, permission denial, tenant isolation, strict validation, idempotent replay and concurrency, provider resilience, retry boundaries, tenant rate limiting, and execution metrics.
+The suite covers authorized execution, permission denial, tenant isolation, strict validation, idempotent replay and concurrency, provider resilience, explicit retry classification, timeout cancellation, tenant rate limiting, circuit breaking, and execution metrics with actual retry attempts.
 
 ## Running locally
 
@@ -160,12 +167,13 @@ The sample deliberately keeps infrastructure small enough to review. A productio
 - durable idempotency storage with retention and conflict semantics
 - distributed locking or atomic persistence where provider calls require it
 - distributed rate limiting
-- provider-specific retry classification and circuit breakers
+- provider-specific retry classification and circuit-breaker state when multiple application instances are involved
 - durable audit storage and OpenTelemetry/metrics integration
 - secret management and credential rotation
 - richer policy evaluation and role/attribute-based authorization
 - request authentication and replay protection
 - resource quotas and abuse controls
+- bounded in-memory state, eviction and lifecycle management for local development implementations
 
 These boundaries are explicit so infrastructure can evolve without coupling provider concerns to the AI/tool contract.
 
