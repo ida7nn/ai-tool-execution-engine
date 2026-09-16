@@ -11,6 +11,7 @@ import {
 } from "../core/errors.js";
 import { executeWithResilience, type ResiliencePolicy } from "../core/resilience.js";
 import { RateLimitError, TenantRateLimiter } from "../core/rate-limiter.js";
+import { CircuitBreakerOpenError, ToolCircuitBreaker } from "../core/circuit-breaker.js";
 import type { MetricsSink } from "../core/observability.js";
 import { validateIdempotencyKey } from "../validation/calendar.js";
 import type {
@@ -43,6 +44,7 @@ type ExecutionPromise = Promise<ToolExecutionResult>;
 export interface ToolExecutorOptions {
   readonly resilience?: ResiliencePolicy;
   readonly rateLimiter?: TenantRateLimiter;
+  readonly circuitBreaker?: ToolCircuitBreaker;
   readonly metrics?: MetricsSink;
 }
 
@@ -98,7 +100,7 @@ export class ToolExecutor {
       }
     } catch (error) {
       const status = error instanceof AuthorizationError || error instanceof RateLimitError ? "denied" : "failed";
-      this.recordMetric(request.toolName, status, startedAt);
+      this.recordMetric(request.toolName, status, startedAt, 0);
       return {
         executionId,
         toolName: request.toolName,
@@ -113,6 +115,7 @@ export class ToolExecutor {
     executionId: string,
   ): Promise<ToolExecutionResult> {
     const { context, toolName } = request;
+    let attempts = 0;
 
     try {
       const tool = this.registry.get(toolName);
@@ -120,9 +123,23 @@ export class ToolExecutor {
       this.emit({ executionId, context, toolName, type: "permission.checked" });
 
       const input = tool.validateInput(request.input);
-      const output = this.options.resilience
-        ? await executeWithResilience(() => tool.execute(input, context), this.options.resilience)
-        : await tool.execute(input, context);
+      this.options.circuitBreaker?.allow(toolName);
+
+      let output;
+      if (this.options.resilience) {
+        const resilient = await executeWithResilience(
+          (signal) => tool.execute(input, context, signal),
+          this.options.resilience,
+          (attempt) => { attempts = attempt; },
+        );
+        output = resilient.value;
+        attempts = resilient.attempts;
+      } else {
+        attempts = 1;
+        output = await tool.execute(input, context);
+      }
+
+      this.options.circuitBreaker?.recordSuccess(toolName);
       const result: ToolExecutionResult = {
         executionId,
         toolName,
@@ -133,6 +150,9 @@ export class ToolExecutor {
       this.emit({ executionId, context, toolName, type: "tool.executed" });
       return result;
     } catch (error) {
+      if (!(error instanceof CircuitBreakerOpenError)) {
+        this.options.circuitBreaker?.recordFailure(toolName);
+      }
       const denied = error instanceof AuthorizationError || error instanceof RateLimitError;
       this.emit({ executionId, context, toolName, type: denied ? "tool.denied" : "tool.failed" });
 
@@ -142,8 +162,12 @@ export class ToolExecutor {
         status: denied ? "denied" : "failed",
         error: this.publicError(error),
       };
+    } finally {
+      this.lastAttempts.set(executionId, attempts || 1);
     }
   }
+
+  private readonly lastAttempts = new Map<string, number>();
 
   private publicError(error: unknown): string {
     if (
@@ -151,19 +175,26 @@ export class ToolExecutor {
       error instanceof ValidationError ||
       error instanceof ToolNotFoundError ||
       error instanceof IdempotencyKeyError ||
-      error instanceof RateLimitError
+      error instanceof RateLimitError ||
+      error instanceof CircuitBreakerOpenError
     ) {
       return error.message;
     }
     return error instanceof Error ? error.message : "Unknown execution error";
   }
 
-  private recordMetric(toolName: string, status: ToolExecutionResult["status"], startedAt: number): void {
+  private recordMetric(
+    toolName: string,
+    status: ToolExecutionResult["status"],
+    startedAt: number,
+    fallbackAttempts?: number,
+  ): void {
+    const attempts = fallbackAttempts ?? [...this.lastAttempts.values()].at(-1) ?? 1;
     this.options.metrics?.record({
       toolName,
       status,
       durationMs: Date.now() - startedAt,
-      attemptCount: this.options.resilience?.retry?.maxAttempts ?? 1,
+      attemptCount: attempts,
     });
   }
 
