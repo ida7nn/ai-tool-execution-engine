@@ -8,7 +8,7 @@ A production-oriented TypeScript engineering sample demonstrating how an AI appl
 
 When an AI agent can do more than generate text, the application needs a reliable execution boundary between **what the model wants to do** and **what the platform is actually allowed to do**.
 
-This sample focuses on that boundary: typed tools, tenant isolation, explicit permissions, input validation, idempotency, integration adapters, resilience controls, tenant rate limiting, circuit breaking, structured audit events, metrics, request authentication, replay protection, resource governance, and automated verification.
+This sample focuses on that boundary: typed tools, tenant isolation, explicit permissions, input validation, idempotency, integration adapters, resilience controls, tenant rate limiting, circuit breaking, structured audit events, metrics, request authentication, replay protection, resource governance, distributed execution coordination, and automated verification.
 
 ## Architecture
 
@@ -25,13 +25,13 @@ This sample focuses on that boundary: typed tools, tenant isolation, explicit pe
  |   Tool Executor   |------>| Audit Sink       |
  +---------+---------+       +------------------+
            |
-     +-----+------+--------------------------------+
-     |            |             |         |         |
-     v            v             v         v         v
- Permissions   Rate Limit   Resilience  Circuit   Resource
- + Policy      per Tenant   Timeout/Retry Breaker  Governance
-     |            |             |         |       limits
-     +------------+-------------+---------+---------+
+     +-----+------+--------------------------------------+
+     |            |             |         |        |      |
+     v            v             v         v        v      v
+ Permissions   Rate Limit   Resilience  Circuit  Resource Distributed
+ + Policy      per Tenant   Timeout/Retry Breaker Governance Execution
+     |            |             |         |       limits   Coordination
+     +------------+-------------+---------+---------+---------+
                               |
                               v
                        Input Validation
@@ -103,7 +103,13 @@ Requests crossing a network or trust boundary can be wrapped by `SecureToolExecu
 
 The executor can enforce maximum serialized input and output sizes and a separate execution-time budget. Input limits are checked before provider execution; output limits are checked before a result is accepted; execution budgets propagate cancellation through `AbortSignal`, including when normal retry/timeout resilience is also configured.
 
-The sample keeps state in memory deliberately. Production deployments should use durable idempotency storage, distributed rate limiting/coordination, durable telemetry infrastructure, and shared replay-protection state.
+### 13. Distributed execution coordination
+
+An optional `DistributedExecutionStore` moves idempotency coordination outside a single application process. An atomic `claim()` ensures that only one worker owns a given tenant-scoped execution key at a time. Other workers wait for the shared execution to complete and reuse the successful result instead of making another provider call. Failed work releases its claim so a later worker can retry.
+
+The included in-memory implementation is deliberately a reference adapter: separate `ToolExecutor` instances can share the same store to demonstrate cross-worker coordination. A production implementation should map the same contract to durable storage with an atomic claim operation, durable result retention, lease/ownership expiry, and safe recovery from worker crashes.
+
+The sample keeps state in memory deliberately. Production deployments should use durable idempotency/execution storage, distributed rate limiting/coordination, durable telemetry infrastructure, and shared replay-protection state.
 
 ## Included tools
 
@@ -119,15 +125,17 @@ The second tool is intentionally read-only. It demonstrates that permissions are
 1. Network-facing code authenticates the request and checks replay protection.
 2. Executor validates tenant and actor context.
 3. A tenant-scoped idempotency replay is resolved before consuming a new rate-limit slot.
-4. Executor resolves the tool from the registry.
-5. Executor checks required permissions.
-6. Tool validates untrusted input.
-7. Resource governance checks input limits.
-8. Circuit breaker checks provider health.
-9. Provider execution is protected by resource and optional timeout/retry policy.
-10. Output limits are checked.
-11. A typed result is returned.
-12. Audit events and metrics capture the lifecycle.
+4. If configured, a distributed execution store atomically claims the shared execution key.
+5. Executor resolves the tool from the registry.
+6. Executor checks required permissions.
+7. Tool validates untrusted input.
+8. Resource governance checks input limits.
+9. Circuit breaker checks provider health.
+10. Provider execution is protected by resource and optional timeout/retry policy.
+11. Output limits are checked.
+12. A successful result is committed to the shared execution store when distributed coordination is enabled.
+13. A typed result is returned.
+14. Audit events and metrics capture the lifecycle.
 
 ## Project structure
 
@@ -142,7 +150,8 @@ src/
 ├── core/
 │   ├── errors.ts                # Typed boundary errors
 │   ├── circuit-breaker.ts       # Per-tool provider circuit breaker
-│   ├── idempotency.ts           # Pluggable idempotency store
+│   ├── distributed-execution.ts # Cross-worker execution coordination
+│   ├── idempotency.ts           # Pluggable local idempotency store
 │   ├── observability.ts         # Metrics sink and in-memory implementation
 │   ├── rate-limiter.ts          # Rate limiter contract + tenant implementation
 │   ├── resilience.ts            # Timeout, cancellation and retry policy
@@ -162,16 +171,17 @@ src/
 └── index.ts                     # Small executable example
 
 tests/
-├── tool-executor.test.ts        # Security, validation and concurrency behaviour
-├── phase3.test.ts               # Resilience, rate limiting and metrics
-├── phase4.test.ts               # Retry classification, cancellation and circuit breaking
-├── phase5-security.test.ts      # Authentication and replay protection
-└── phase6-resource-governance.test.ts # Resource limits and execution budgets
+├── tool-executor.test.ts                  # Security, validation and concurrency behaviour
+├── phase3.test.ts                         # Resilience, rate limiting and metrics
+├── phase4.test.ts                         # Retry classification, cancellation and circuit breaking
+├── phase5-security.test.ts                # Authentication and replay protection
+├── phase6-resource-governance.test.ts     # Resource limits and execution budgets
+└── phase7-distributed-execution.test.ts   # Cross-worker claims and provider-call deduplication
 ```
 
 ## Testing
 
-The suite covers authorized execution, permission denial, tenant isolation, strict validation, idempotent replay and concurrency, provider resilience, explicit retry classification, timeout cancellation, tenant rate limiting, circuit breaking, execution metrics with actual retry attempts, HMAC authentication, timestamp/nonce validation, replay attacks, input/output limits, and cooperative execution cancellation.
+The suite covers authorized execution, permission denial, tenant isolation, strict validation, idempotent replay and concurrency, provider resilience, explicit retry classification, timeout cancellation, tenant rate limiting, circuit breaking, execution metrics with actual retry attempts, HMAC authentication, timestamp/nonce validation, replay attacks, input/output limits, cooperative execution cancellation, atomic distributed claims, cross-worker idempotency, tenant-scoped coordination, claim release, and shared-result waiting.
 
 ## Running locally
 
@@ -190,8 +200,10 @@ CI runs the same typecheck, test, and build commands on pushes and pull requests
 
 The sample deliberately keeps infrastructure small enough to review. A production implementation would additionally need:
 
-- durable idempotency storage with retention, conflict semantics, and atomic claim operations
+- durable idempotency and execution storage with retention, conflict semantics, atomic claim operations, and crash recovery
+- short-lived execution leases or fencing tokens so a stalled worker cannot retain ownership forever
 - distributed locking or atomic persistence where provider calls require it
+- provider-call deduplication semantics that match the provider's own idempotency guarantees
 - distributed rate limiting
 - shared replay-protection state with atomic nonce claims
 - provider-specific retry classification and circuit-breaker state when multiple application instances are involved
