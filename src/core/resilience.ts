@@ -12,6 +12,7 @@ export interface RetryPolicy {
   readonly maxAttempts: number;
   readonly baseDelayMs: number;
   readonly maxDelayMs: number;
+  readonly shouldRetry?: (error: unknown) => boolean;
 }
 
 export interface ResiliencePolicy {
@@ -19,23 +20,38 @@ export interface ResiliencePolicy {
   readonly retry?: RetryPolicy;
 }
 
+export interface ResilientExecutionResult<T> {
+  readonly value: T;
+  readonly attempts: number;
+}
+
 export async function executeWithResilience<T>(
-  operation: () => Promise<T>,
+  operation: (signal: AbortSignal) => Promise<T>,
   policy: ResiliencePolicy,
-): Promise<T> {
+  onAttempt?: (attempt: number) => void,
+): Promise<ResilientExecutionResult<T>> {
   const retry = policy.retry ?? { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 };
   if (!Number.isInteger(retry.maxAttempts) || retry.maxAttempts < 1) {
     throw new ValidationError("retry.maxAttempts must be a positive integer.");
   }
   if (policy.timeoutMs <= 0) throw new ValidationError("timeoutMs must be positive.");
+  if (retry.baseDelayMs < 0 || retry.maxDelayMs < 0) {
+    throw new ValidationError("Retry delays cannot be negative.");
+  }
 
   let attempt = 0;
   while (attempt < retry.maxAttempts) {
     attempt += 1;
+    onAttempt?.(attempt);
     try {
-      return await withTimeout(operation(), policy.timeoutMs);
+      const controller = new AbortController();
+      return {
+        value: await withTimeout(operation(controller.signal), policy.timeoutMs, controller),
+        attempts: attempt,
+      };
     } catch (error) {
-      if (!isRetryable(error) || attempt >= retry.maxAttempts) throw error;
+      const retryable = retry.shouldRetry ? retry.shouldRetry(error) : isRetryable(error);
+      if (!retryable || attempt >= retry.maxAttempts) throw error;
       const delay = Math.min(retry.maxDelayMs, retry.baseDelayMs * 2 ** (attempt - 1));
       if (delay > 0) await sleep(delay);
     }
@@ -47,10 +63,17 @@ function isRetryable(error: unknown): boolean {
   return !(error instanceof AuthorizationError || error instanceof ValidationError || error instanceof ExecutionTimeoutError);
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  controller: AbortController,
+): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new ExecutionTimeoutError(timeoutMs)), timeoutMs);
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new ExecutionTimeoutError(timeoutMs));
+    }, timeoutMs);
   });
   try {
     return await Promise.race([promise, timeout]);
