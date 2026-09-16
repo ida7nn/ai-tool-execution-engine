@@ -6,5 +6,6 @@ export interface IntegrationAdapter {
     operation: string,
     input: unknown,
     context: ExecutionContext,
+    signal?: AbortSignal,
   ): Promise<unknown>;
 }
