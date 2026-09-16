@@ -18,6 +18,7 @@ export interface ToolDefinition<TInput, TOutput> {
   readonly execute: (
     input: TInput,
     context: ExecutionContext,
+    signal?: AbortSignal,
   ) => Promise<TOutput>;
 }
 
