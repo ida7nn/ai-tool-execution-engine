@@ -5,6 +5,7 @@ import { executeWithResilience, type ResiliencePolicy } from "../core/resilience
 import { RateLimitError, type RateLimiter } from "../core/rate-limiter.js";
 import { CircuitBreakerOpenError, ToolCircuitBreaker } from "../core/circuit-breaker.js";
 import { InMemoryIdempotencyStore, type IdempotencyStore } from "../core/idempotency.js";
+import { DistributedExecutionConflictError, type DistributedExecutionStore, waitForDistributedExecution, type DistributedExecutionOptions } from "../core/distributed-execution.js";
 import type { MetricsSink } from "../core/observability.js";
 import { ResourceLimitError, type ResourceGovernance } from "../core/resource-governance.js";
 import { validateIdempotencyKey } from "../validation/calendar.js";
@@ -30,6 +31,8 @@ export interface ToolExecutorOptions {
   readonly rateLimiter?: RateLimiter;
   readonly circuitBreaker?: ToolCircuitBreaker;
   readonly idempotencyStore?: IdempotencyStore;
+  readonly distributedExecutionStore?: DistributedExecutionStore;
+  readonly distributedExecution?: DistributedExecutionOptions;
   readonly metrics?: MetricsSink;
   readonly resourceGovernance?: ResourceGovernance;
 }
@@ -48,6 +51,8 @@ export class ToolExecutor {
   async execute<TOutput = unknown>(request: ToolExecutionRequest): Promise<ToolExecutionResult<TOutput>> {
     const executionId = randomUUID();
     const startedAt = Date.now();
+    let distributedClaimed = false;
+    let distributedKey: string | undefined;
 
     try {
       assertTenantContext(request.context);
@@ -59,6 +64,21 @@ export class ToolExecutor {
         if (completed) return completed as ToolExecutionResult<TOutput>;
         const inFlight = this.idempotencyStore.getInFlight(cacheKey);
         if (inFlight) return (await inFlight) as ToolExecutionResult<TOutput>;
+      }
+
+      if (cacheKey && this.options.distributedExecutionStore) {
+        distributedKey = cacheKey;
+        const claim = this.options.distributedExecutionStore.claim(cacheKey, executionId);
+        if (!claim.acquired) {
+          const sharedResult = await waitForDistributedExecution(
+            this.options.distributedExecutionStore,
+            cacheKey,
+            this.options.distributedExecution ?? { maxWaitMs: 30_000, pollIntervalMs: 25 },
+          );
+          if (sharedResult) return sharedResult as ToolExecutionResult<TOutput>;
+          throw new DistributedExecutionConflictError(cacheKey);
+        }
+        distributedClaimed = true;
       }
 
       this.options.rateLimiter?.consume(request.context.tenantId);
@@ -74,13 +94,23 @@ export class ToolExecutor {
       this.idempotencyStore.setInFlight(cacheKey, execution);
       try {
         const result = await execution;
-        if (result.status === "succeeded") this.idempotencyStore.setCompleted(cacheKey, result);
+        if (result.status === "succeeded") {
+          this.idempotencyStore.setCompleted(cacheKey, result);
+          if (distributedClaimed && distributedKey) {
+            this.options.distributedExecutionStore?.complete(distributedKey, executionId, result);
+          }
+        } else if (distributedClaimed && distributedKey) {
+          this.options.distributedExecutionStore?.release(distributedKey, executionId);
+        }
         this.recordMetric(request.toolName, result.status, startedAt, executionId);
         return result as ToolExecutionResult<TOutput>;
       } finally {
         this.idempotencyStore.deleteInFlight(cacheKey);
       }
     } catch (error) {
+      if (distributedClaimed && distributedKey) {
+        this.options.distributedExecutionStore?.release(distributedKey, executionId);
+      }
       const status = error instanceof AuthorizationError || error instanceof RateLimitError ? "denied" : "failed";
       this.recordMetric(request.toolName, status, startedAt, executionId);
       return { executionId, toolName: request.toolName, status, error: this.publicError(error) } as ToolExecutionResult<TOutput>;
@@ -132,7 +162,7 @@ export class ToolExecutor {
   private readonly attempts = new Map<string, number>();
 
   private publicError(error: unknown): string {
-    if (error instanceof AuthorizationError || error instanceof ValidationError || error instanceof ToolNotFoundError || error instanceof IdempotencyKeyError || error instanceof RateLimitError || error instanceof CircuitBreakerOpenError || error instanceof ResourceLimitError) return error.message;
+    if (error instanceof AuthorizationError || error instanceof ValidationError || error instanceof ToolNotFoundError || error instanceof IdempotencyKeyError || error instanceof RateLimitError || error instanceof CircuitBreakerOpenError || error instanceof ResourceLimitError || error instanceof DistributedExecutionConflictError) return error.message;
     return error instanceof Error ? error.message : "Unknown execution error";
   }
 
