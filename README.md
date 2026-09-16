@@ -8,7 +8,7 @@ A production-oriented TypeScript engineering sample demonstrating how an AI appl
 
 When an AI agent can do more than generate text, the application needs a reliable execution boundary between **what the model wants to do** and **what the platform is actually allowed to do**.
 
-This sample focuses on that boundary: typed tools, tenant isolation, explicit permissions, input validation, idempotency, integration adapters, resilience controls, tenant rate limiting, circuit breaking, structured audit events, metrics, and automated verification.
+This sample focuses on that boundary: typed tools, tenant isolation, explicit permissions, input validation, idempotency, integration adapters, resilience controls, tenant rate limiting, circuit breaking, structured audit events, metrics, request authentication, replay protection, resource governance, and automated verification.
 
 ## Architecture
 
@@ -25,22 +25,30 @@ This sample focuses on that boundary: typed tools, tenant isolation, explicit pe
  |   Tool Executor   |------>| Audit Sink       |
  +---------+---------+       +------------------+
            |
-     +-----+------+--------------------------+
-     |            |             |            |
-     v            v             v            v
- Permissions   Rate Limit   Resilience   Circuit Breaker
- + Policy      per Tenant   Timeout/Retry  per Tool
-     |            |             |            |
-     +------------+-------------+------------+
-                  |
-                  v
-           Input Validation
-                  |
-                  v
-         Integration Adapter
-                  |
-                  v
-           External Service
+     +-----+------+--------------------------------+
+     |            |             |         |         |
+     v            v             v         v         v
+ Permissions   Rate Limit   Resilience  Circuit   Resource
+ + Policy      per Tenant   Timeout/Retry Breaker  Governance
+     |            |             |         |       limits
+     +------------+-------------+---------+---------+
+                              |
+                              v
+                       Input Validation
+                              |
+                              v
+                     Integration Adapter
+                              |
+                              v
+                       External Service
+
+Network / Trust Boundary
+          |
+          v
+ +-----------------------+
+ | SecureToolExecutor    |
+ | HMAC + replay checks  |
+ +-----------------------+
 ```
 
 The executor is the enforcement boundary. Tool definitions declare their required permissions, but the caller does not get to bypass the executor by invoking an adapter directly through the normal execution path.
@@ -87,7 +95,15 @@ A lightweight token-window limiter can cap execution requests per tenant. The ex
 
 The executor emits structured lifecycle events containing execution metadata rather than raw inputs or customer payloads. A metrics sink records tool, outcome, duration, and the **actual number of attempts**, rather than only the configured retry budget.
 
-The sample keeps state in memory deliberately. Production deployments should use durable idempotency storage, distributed rate limiting/coordination, and durable telemetry infrastructure.
+### 11. Request authentication and replay protection
+
+Requests crossing a network or trust boundary can be wrapped by `SecureToolExecutor`. The sample supports HMAC-SHA256 request signatures, bounded timestamp skew, nonce validation, constant-time signature comparison, pluggable secret resolution, and tenant-scoped replay protection. Authentication failures are rejected before the underlying tool executor runs.
+
+### 12. Resource governance
+
+The executor can enforce maximum serialized input and output sizes and a separate execution-time budget. Input limits are checked before provider execution; output limits are checked before a result is accepted; execution budgets propagate cancellation through `AbortSignal`, including when normal retry/timeout resilience is also configured.
+
+The sample keeps state in memory deliberately. Production deployments should use durable idempotency storage, distributed rate limiting/coordination, durable telemetry infrastructure, and shared replay-protection state.
 
 ## Included tools
 
@@ -100,16 +116,18 @@ The second tool is intentionally read-only. It demonstrates that permissions are
 
 ## Example execution flow
 
-1. Application requests a tool.
+1. Network-facing code authenticates the request and checks replay protection.
 2. Executor validates tenant and actor context.
 3. A tenant-scoped idempotency replay is resolved before consuming a new rate-limit slot.
 4. Executor resolves the tool from the registry.
 5. Executor checks required permissions.
 6. Tool validates untrusted input.
-7. Circuit breaker checks provider health.
-8. Provider execution is optionally protected by timeout/retry policy.
-9. A typed result is returned.
-10. Audit events and metrics capture the lifecycle.
+7. Resource governance checks input limits.
+8. Circuit breaker checks provider health.
+9. Provider execution is protected by resource and optional timeout/retry policy.
+10. Output limits are checked.
+11. A typed result is returned.
+12. Audit events and metrics capture the lifecycle.
 
 ## Project structure
 
@@ -127,10 +145,15 @@ src/
 │   ├── idempotency.ts           # Pluggable idempotency store
 │   ├── observability.ts         # Metrics sink and in-memory implementation
 │   ├── rate-limiter.ts          # Rate limiter contract + tenant implementation
-│   └── resilience.ts            # Timeout, cancellation and retry policy
+│   ├── resilience.ts            # Timeout, cancellation and retry policy
+│   └── resource-governance.ts   # Input/output/execution resource limits
 ├── integrations/
 │   ├── integration.ts           # Provider adapter contract
 │   └── example-calendar.ts      # Provider-free, tenant-scoped adapter
+├── security/
+│   ├── request-auth.ts          # HMAC request authentication
+│   ├── replay-protection.ts     # Nonce/replay protection abstraction
+│   └── secure-tool-executor.ts  # Trust-boundary security facade
 ├── tools/
 │   ├── create-calendar-event.ts # Typed write tool
 │   └── list-calendar-events.ts  # Typed read tool
@@ -141,12 +164,14 @@ src/
 tests/
 ├── tool-executor.test.ts        # Security, validation and concurrency behaviour
 ├── phase3.test.ts               # Resilience, rate limiting and metrics
-└── phase4.test.ts               # Retry classification, cancellation and circuit breaking
+├── phase4.test.ts               # Retry classification, cancellation and circuit breaking
+├── phase5-security.test.ts      # Authentication and replay protection
+└── phase6-resource-governance.test.ts # Resource limits and execution budgets
 ```
 
 ## Testing
 
-The suite covers authorized execution, permission denial, tenant isolation, strict validation, idempotent replay and concurrency, provider resilience, explicit retry classification, timeout cancellation, tenant rate limiting, circuit breaking, and execution metrics with actual retry attempts.
+The suite covers authorized execution, permission denial, tenant isolation, strict validation, idempotent replay and concurrency, provider resilience, explicit retry classification, timeout cancellation, tenant rate limiting, circuit breaking, execution metrics with actual retry attempts, HMAC authentication, timestamp/nonce validation, replay attacks, input/output limits, and cooperative execution cancellation.
 
 ## Running locally
 
@@ -168,12 +193,13 @@ The sample deliberately keeps infrastructure small enough to review. A productio
 - durable idempotency storage with retention, conflict semantics, and atomic claim operations
 - distributed locking or atomic persistence where provider calls require it
 - distributed rate limiting
+- shared replay-protection state with atomic nonce claims
 - provider-specific retry classification and circuit-breaker state when multiple application instances are involved
 - durable audit storage and OpenTelemetry/metrics integration
-- secret management and credential rotation
+- secret management, credential rotation and key revocation
 - richer policy evaluation and role/attribute-based authorization
-- request authentication and replay protection
-- resource quotas and abuse controls
+- server-derived permissions at the authenticated security boundary
+- resource quotas and abuse controls appropriate to each tenant and tool
 - bounded in-memory state, eviction and lifecycle management for local development implementations
 
 These boundaries are explicit so infrastructure can evolve without coupling provider concerns to the AI/tool contract.
