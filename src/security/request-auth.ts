@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { AuthorizationError } from "../auth/permissions.js";
 import type { ToolExecutionRequest } from "../ai/types.js";
+import type { AuthorizationPrincipal } from "../auth/policy.js";
 
 export interface RequestAuthentication {
   readonly keyId: string;
@@ -9,8 +10,16 @@ export interface RequestAuthentication {
   readonly signature: string;
 }
 
+export interface AuthenticatedPrincipal extends AuthorizationPrincipal {
+  readonly keyId: string;
+}
+
 export interface SecretResolver {
   resolve(keyId: string): string | undefined;
+}
+
+export interface PrincipalResolver {
+  resolve(keyId: string): AuthenticatedPrincipal | undefined;
 }
 
 export interface RequestAuthenticator {
@@ -53,9 +62,6 @@ export function canonicalRequest(
   nonce: string,
 ): string {
   return JSON.stringify({
-    tenantId: request.context.tenantId,
-    actorId: request.context.actorId,
-    permissions: [...request.context.permissions].sort(),
     toolName: request.toolName,
     input: request.input,
     idempotencyKey: request.idempotencyKey ?? null,
@@ -77,5 +83,13 @@ export class InMemorySecretResolver implements SecretResolver {
 
   resolve(keyId: string): string | undefined {
     return this.options.secrets.get(keyId);
+  }
+}
+
+export class InMemoryPrincipalResolver implements PrincipalResolver {
+  constructor(private readonly principals: ReadonlyMap<string, AuthenticatedPrincipal>) {}
+
+  resolve(keyId: string): AuthenticatedPrincipal | undefined {
+    return this.principals.get(keyId);
   }
 }
