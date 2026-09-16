@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { AuthorizationError, type ExecutionContext } from "../auth/permissions.js";
+import { AuthorizationError } from "../auth/permissions.js";
 import type { ToolExecutionRequest } from "../ai/types.js";
 
 export interface RequestAuthentication {
