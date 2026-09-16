@@ -11,7 +11,7 @@ const context: ExecutionContext = {
   permissions: new Set(["customer.read"]),
 };
 
-function registryFor(tool: ToolDefinition<unknown, unknown>): ToolRegistry {
+function registryFor<TInput, TOutput>(tool: ToolDefinition<TInput, TOutput>): ToolRegistry {
   const registry = new ToolRegistry();
   registry.register(tool);
   return registry;
@@ -31,11 +31,9 @@ describe("Phase 3 resilience and observability", () => {
         return "ok";
       },
     };
-
     const executor = new ToolExecutor(registryFor(tool), undefined, {
       resilience: { timeoutMs: 100, retry: { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0 } },
     });
-
     const result = await executor.execute({ toolName: tool.name, input: {}, context });
     expect(result.status).toBe("succeeded");
     expect(calls).toBe(3);
@@ -50,11 +48,9 @@ describe("Phase 3 resilience and observability", () => {
       validateInput: () => ({}),
       execute,
     };
-
     const executor = new ToolExecutor(registryFor(tool), undefined, {
       resilience: { timeoutMs: 100, retry: { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0 } },
     });
-
     const result = await executor.execute({ toolName: tool.name, input: {}, context });
     expect(result.status).toBe("denied");
     expect(execute).not.toHaveBeenCalled();
@@ -71,7 +67,6 @@ describe("Phase 3 resilience and observability", () => {
     const executor = new ToolExecutor(registryFor(tool), undefined, {
       rateLimiter: new TenantRateLimiter({ maxRequests: 2, windowMs: 60_000 }),
     });
-
     expect((await executor.execute({ toolName: tool.name, input: {}, context })).status).toBe("succeeded");
     expect((await executor.execute({ toolName: tool.name, input: {}, context })).status).toBe("succeeded");
     const limited = await executor.execute({ toolName: tool.name, input: {}, context });
