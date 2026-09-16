@@ -53,9 +53,6 @@ export class BoundedResourceGovernance implements ResourceGovernance {
   }
 
   createExecutionGuard(): AbortSignal {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.policy.maxExecutionMs);
-    timer.unref?.();
-    return controller.signal;
+    return AbortSignal.timeout(this.policy.maxExecutionMs);
   }
 }
