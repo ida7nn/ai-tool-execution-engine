@@ -6,94 +6,97 @@ A production-oriented TypeScript engineering sample demonstrating how an AI appl
 
 ## Why this exists
 
-LLM applications become substantially more complex when the model can do more than generate text. Once an AI agent can create a calendar event, update a customer, send a message, or call another business system, the application needs a reliable execution boundary between **what the model wants to do** and **what the platform is actually allowed to do**.
+When an AI agent can do more than generate text, the application needs a reliable execution boundary between **what the model wants to do** and **what the platform is actually allowed to do**.
 
-This sample focuses on that boundary.
+This sample focuses on that boundary: typed tools, tenant isolation, explicit permissions, input validation, idempotency, integration adapters, structured audit events, and automated verification.
 
 ## Architecture
 
 ```text
-                    AI / Application Layer
-                             |
-                             v
-                     +---------------+
-                     | Tool Registry |
-                     +-------+-------+
-                             |
-                             v
-                     +---------------+
-                     | Tenant Context |
-                     +-------+-------+
-                             |
-                             v
-                     +---------------+
-                     |  Permissions  |
-                     +-------+-------+
-                             |
-                        allowed?
-                       /        \
-                     no          yes
-                     |             |
-                     v             v
-                   DENY       Tool Executor
-                                  |
-                                  v
-                         Integration Adapter
-                                  |
-                                  v
-                           External Service
-                                  |
-                                  v
-                              Audit Event
+ AI / Application Layer
+          |
+          v
+ +-------------------+
+ |    Tool Registry  |
+ +---------+---------+
+           |
+           v
+ +-------------------+       +------------------+
+ |   Tool Executor   |------>| Audit Sink       |
+ +---------+---------+       +------------------+
+           |
+     +-----+-----+
+     |           |
+     v           v
+ Tenant       Permissions
+ Context      + Policy
+     |           |
+     +-----+-----+
+           |
+           v
+     Input Validation
+           |
+           v
+   Integration Adapter
+           |
+           v
+     External Service
 ```
 
-The important design choice is that **tool definitions declare their required permissions**, while the executor owns the authorization boundary. A tool cannot simply assume that the caller is allowed to perform its action.
+The executor is the enforcement boundary. Tool definitions declare their required permissions, but the caller does not get to bypass the executor by invoking an adapter directly through the normal execution path.
 
 ## Design principles
 
 ### 1. Tenant isolation
 
-Every execution carries an explicit `tenantId` and `actorId`. Idempotency keys are namespaced by tenant so that identical keys belonging to different tenants cannot collide.
+Every execution carries an explicit `tenantId` and `actorId`. Idempotency keys are namespaced by tenant, and the example calendar adapter stores events under the current tenant.
 
 ### 2. Explicit permissions
 
-Tools declare permissions such as:
-
-- `calendar.read`
-- `calendar.write`
-- `customer.read`
-- `customer.write`
-
-The executor checks the complete required permission set before input validation or external execution.
+Tools declare permissions such as `calendar.read` and `calendar.write`. Authorization happens before input validation or external execution.
 
 ### 3. Typed tool contracts
 
-A tool defines its input validator, required permissions, description, and typed execution result. This keeps the execution layer independent from any specific LLM provider.
+Tools expose a typed input validator and typed output contract while the executor remains independent of any specific LLM provider.
 
-### 4. Provider isolation
+### 4. Strict boundary validation
 
-External services are represented through integration adapters. The tool layer does not need to know how a provider API works; it asks an adapter to perform a supported operation.
+The calendar tool accepts only plain objects, trims titles, enforces a maximum title length, requires UTC ISO-8601 timestamps, and verifies that the end time follows the start time.
 
-### 5. Idempotent execution
+### 5. Provider isolation
 
-An optional idempotency key prevents accidental duplicate execution. The cache is intentionally in-memory for this sample; a production implementation would persist idempotency state in a durable store with an appropriate retention policy.
+External services are represented through integration adapters. The tool layer does not contain provider-specific credentials or HTTP details.
 
-### 6. Auditability
+### 6. Idempotent execution
 
-The executor emits structured events for request, permission check, execution, denial, and failure. The sample deliberately avoids logging tool inputs or credentials, reducing the chance of leaking sensitive data through audit logs.
+Successful results are cached by a tenant-scoped idempotency key. Concurrent requests with the same key are coalesced so they do not race into duplicate provider calls. Failed and denied executions are not persisted as successful work.
 
-## Example flow
+The sample uses in-memory state deliberately. A production service would replace it with durable storage and, where necessary, distributed coordination.
 
-The included calendar tool demonstrates:
+### 7. Auditability without data leakage
 
-1. An application requests `calendar.create_event`.
-2. The registry resolves the tool.
-3. The executor validates the tenant and actor context.
-4. The executor verifies `calendar.write`.
-5. Tool input is validated.
-6. The integration adapter performs the provider-specific operation.
+The executor emits structured lifecycle events for request, permission checks, execution, denial, and failure. Audit events contain execution metadata, not raw tool inputs, credentials, or customer payloads.
+
+## Included tools
+
+| Tool | Permission | Purpose |
+| --- | --- | --- |
+| `calendar.create_event` | `calendar.write` | Creates an event for the current tenant |
+| `calendar.list_events` | `calendar.read` | Lists events for the current tenant |
+
+The second tool is intentionally read-only. It demonstrates that permissions are part of the tool contract rather than a convention hidden inside an integration implementation.
+
+## Example execution flow
+
+1. Application requests `calendar.create_event`.
+2. Executor validates tenant and actor context.
+3. Executor resolves the tool from the registry.
+4. Executor checks `calendar.write`.
+5. Tool validates untrusted input.
+6. Adapter performs the provider-independent operation.
 7. A typed result is returned.
-8. Audit events record the execution lifecycle.
+8. Audit events capture the lifecycle.
+9. A repeated idempotent request returns the successful result without executing the adapter again.
 
 ## Project structure
 
@@ -101,20 +104,41 @@ The included calendar tool demonstrates:
 src/
 ├── ai/
 │   ├── types.ts                 # Core tool and execution contracts
-│   ├── tool-registry.ts         # Runtime tool registration and lookup
+│   ├── tool-registry.ts         # Runtime registration and lookup
 │   └── tool-executor.ts         # Authorization, execution, idempotency, audit
 ├── auth/
 │   └── permissions.ts           # Tenant and permission enforcement
+├── core/
+│   └── errors.ts                # Typed boundary errors
 ├── integrations/
 │   ├── integration.ts           # Provider adapter contract
-│   └── example-calendar.ts      # Provider-free calendar adapter
+│   └── example-calendar.ts      # Provider-free, tenant-scoped adapter
 ├── tools/
-│   └── create-calendar-event.ts # Typed calendar tool
+│   ├── create-calendar-event.ts # Typed write tool
+│   └── list-calendar-events.ts  # Typed read tool
+├── validation/
+│   └── calendar.ts              # Boundary validation helpers
 └── index.ts                     # Small executable example
 
 tests/
-└── tool-executor.test.ts        # Security and execution behaviour
+└── tool-executor.test.ts        # Security, validation and concurrency behaviour
 ```
+
+## Testing
+
+The suite covers:
+
+- authorized execution
+- permission denial
+- missing tenant context
+- malformed input
+- strict timestamp validation
+- idempotent replay
+- concurrent idempotent requests
+- tenant-scoped idempotency
+- read/write permission separation
+- tenant-scoped data retrieval
+- invalid idempotency keys
 
 ## Running locally
 
@@ -127,22 +151,23 @@ npm run typecheck
 npm run build
 ```
 
-## Testing focus
-
-The test suite covers:
-
-- successful authorized execution
-- permission denial
-- idempotent replay
-- tenant-scoped idempotency
-
-The goal is not to reproduce an entire production platform in a small repository. The goal is to make the critical execution boundary easy to inspect, reason about, and extend.
+CI runs the same typecheck, test, and build commands on pushes and pull requests to `main`.
 
 ## Production considerations
 
-A production implementation would additionally need durable idempotency storage, distributed locking where required, provider-specific retries and timeouts, secret management, rate limiting, richer policy evaluation, persistent audit storage, observability, and stronger schema validation at service boundaries.
+This repository intentionally keeps infrastructure small enough to review. A production implementation would additionally need:
 
-Those concerns are intentionally called out rather than hidden behind a large framework so the core design remains easy to review.
+- durable idempotency storage with retention and conflict semantics
+- distributed locking or atomic persistence where provider calls require it
+- provider-specific retries, timeouts, circuit breakers, and rate limits
+- durable audit storage and observability
+- secret management and credential rotation
+- richer policy evaluation and role/attribute-based authorization
+- schema validation at every service boundary
+- request authentication and replay protection
+- resource quotas and abuse controls
+
+These are documented explicitly rather than hidden behind framework code.
 
 ## Author
 
