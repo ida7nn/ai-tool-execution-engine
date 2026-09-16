@@ -1,3 +1,5 @@
+import type { RequestAuthentication } from "../security/request-auth.js";
+
 export type Permission =
   | "calendar.read"
   | "calendar.write"
@@ -27,6 +29,7 @@ export interface ToolExecutionRequest {
   readonly input: unknown;
   readonly context: ExecutionContext;
   readonly idempotencyKey?: string;
+  readonly authentication?: RequestAuthentication;
 }
 
 export interface ToolExecutionResult<TOutput = unknown> {
