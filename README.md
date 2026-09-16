@@ -69,11 +69,11 @@ External services are represented through integration adapters. The tool layer d
 
 ### 6. Idempotent execution
 
-Successful results are cached by a tenant-scoped idempotency key. Concurrent requests with the same key are coalesced so they do not race into duplicate provider calls. Failed and denied executions are not persisted as successful work.
+Successful results are cached by a tenant-scoped idempotency key. Concurrent requests with the same key are coalesced so they do not race into duplicate provider calls. The executor depends on an `IdempotencyStore` abstraction, allowing a production deployment to replace the in-memory implementation with a durable store. Failed and denied executions are not persisted as successful work.
 
 ### 7. Resilience at the provider boundary
 
-Provider operations can be protected with bounded timeouts and exponential-backoff retries. Authorization, validation, and timeout errors are not retried by default. A `shouldRetry` policy hook allows provider-specific classification when a production integration knows which errors are transient. Timeout handling also aborts the execution signal so cooperative adapters can stop work rather than merely timing out the caller.
+Provider operations can be protected with bounded timeouts and exponential-backoff retries. Authorization, validation, and timeout errors are not retried by default. A `shouldRetry` policy hook allows provider-specific classification when a production integration knows which errors are transient. Timeout handling aborts the execution signal so cooperative adapters can stop work rather than merely timing out the caller.
 
 ### 8. Circuit breaking
 
@@ -81,7 +81,7 @@ A per-tool circuit breaker prevents repeated calls to a failing provider after a
 
 ### 9. Tenant rate limiting
 
-A lightweight token-window limiter can cap execution requests per tenant. The limiter is intentionally injected behind the executor so production deployments can replace it with a distributed implementation without changing tool contracts.
+A lightweight token-window limiter can cap execution requests per tenant. The executor depends on a `RateLimiter` abstraction so production deployments can replace the in-memory implementation with a distributed implementation without changing tool contracts.
 
 ### 10. Observability without data leakage
 
@@ -124,8 +124,9 @@ src/
 ├── core/
 │   ├── errors.ts                # Typed boundary errors
 │   ├── circuit-breaker.ts       # Per-tool provider circuit breaker
+│   ├── idempotency.ts           # Pluggable idempotency store
 │   ├── observability.ts         # Metrics sink and in-memory implementation
-│   ├── rate-limiter.ts          # Tenant-scoped request limiter
+│   ├── rate-limiter.ts          # Rate limiter contract + tenant implementation
 │   └── resilience.ts            # Timeout, cancellation and retry policy
 ├── integrations/
 │   ├── integration.ts           # Provider adapter contract
@@ -164,7 +165,7 @@ CI runs the same typecheck, test, and build commands on pushes and pull requests
 
 The sample deliberately keeps infrastructure small enough to review. A production implementation would additionally need:
 
-- durable idempotency storage with retention and conflict semantics
+- durable idempotency storage with retention, conflict semantics, and atomic claim operations
 - distributed locking or atomic persistence where provider calls require it
 - distributed rate limiting
 - provider-specific retry classification and circuit-breaker state when multiple application instances are involved
