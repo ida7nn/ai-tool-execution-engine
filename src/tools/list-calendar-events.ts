@@ -1,8 +1,5 @@
 import type { ToolDefinition } from "../ai/types.js";
-import type {
-  CalendarEventRecord,
-  ExampleCalendarAdapter,
-} from "../integrations/example-calendar.js";
+import type { CalendarEventRecord, ExampleCalendarAdapter } from "../integrations/example-calendar.js";
 
 export function listCalendarEventsTool(
   adapter: ExampleCalendarAdapter,
@@ -12,13 +9,11 @@ export function listCalendarEventsTool(
     description: "List calendar events belonging to the current tenant.",
     requiredPermissions: ["calendar.read"],
     validateInput: (input: unknown) => {
-      if (!isEmptyObject(input)) {
-        throw new Error("calendar.list_events does not accept input fields.");
-      }
+      if (!isEmptyObject(input)) throw new Error("calendar.list_events does not accept input fields.");
       return {};
     },
-    execute: async (_input, context) => {
-      const result = await adapter.execute("list-events", undefined, context);
+    execute: async (_input, context, signal) => {
+      const result = await adapter.execute("list-events", undefined, context, signal);
       if (!Array.isArray(result)) throw new Error("Calendar adapter returned an invalid list result.");
       return result;
     },
