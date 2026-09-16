@@ -1,0 +1,17 @@
+{
+  "name": "ai-tool-execution-engine",
+  "version": "1.0.0",
+  "private": false,
+  "description": "Production-oriented TypeScript example of a multi-tenant AI tool execution layer.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  }
+}
