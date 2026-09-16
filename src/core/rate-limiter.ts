@@ -3,6 +3,10 @@ export interface RateLimitPolicy {
   readonly windowMs: number;
 }
 
+export interface RateLimiter {
+  consume(tenantId: string): void;
+}
+
 export class RateLimitError extends Error {
   readonly retryAfterMs: number;
 
@@ -18,7 +22,7 @@ interface Bucket {
   windowStartedAt: number;
 }
 
-export class TenantRateLimiter {
+export class TenantRateLimiter implements RateLimiter {
   private readonly buckets = new Map<string, Bucket>();
 
   constructor(private readonly policy: RateLimitPolicy) {
