@@ -6,6 +6,7 @@ import { RateLimitError, type RateLimiter } from "../core/rate-limiter.js";
 import { CircuitBreakerOpenError, ToolCircuitBreaker } from "../core/circuit-breaker.js";
 import { InMemoryIdempotencyStore, type IdempotencyStore } from "../core/idempotency.js";
 import type { MetricsSink } from "../core/observability.js";
+import { ResourceLimitError, type ResourceGovernance } from "../core/resource-governance.js";
 import { validateIdempotencyKey } from "../validation/calendar.js";
 import type { ExecutionContext, ToolExecutionRequest, ToolExecutionResult } from "./types.js";
 import { ToolRegistry } from "./tool-registry.js";
@@ -30,6 +31,7 @@ export interface ToolExecutorOptions {
   readonly circuitBreaker?: ToolCircuitBreaker;
   readonly idempotencyStore?: IdempotencyStore;
   readonly metrics?: MetricsSink;
+  readonly resourceGovernance?: ResourceGovernance;
 }
 
 export class ToolExecutor {
@@ -94,12 +96,14 @@ export class ToolExecutor {
       assertPermissions(context, tool);
       this.emit({ executionId, context, toolName, type: "permission.checked" });
       const input = tool.validateInput(request.input);
+      this.options.resourceGovernance?.assertInputWithinLimit(input);
       this.options.circuitBreaker?.allow(toolName);
 
       let output;
+      const resourceSignal = this.options.resourceGovernance?.createExecutionGuard();
       if (this.options.resilience) {
         const resilient = await executeWithResilience(
-          (signal) => tool.execute(input, context, signal),
+          (signal) => tool.execute(input, context, resourceSignal ? AbortSignal.any([signal, resourceSignal]) : signal),
           this.options.resilience,
           (attempt) => { attempts = attempt; },
         );
@@ -107,9 +111,10 @@ export class ToolExecutor {
         attempts = resilient.attempts;
       } else {
         attempts = 1;
-        output = await tool.execute(input, context);
+        output = await tool.execute(input, context, resourceSignal);
       }
 
+      this.options.resourceGovernance?.assertOutputWithinLimit(output);
       this.options.circuitBreaker?.recordSuccess(toolName);
       const result: ToolExecutionResult = { executionId, toolName, status: "succeeded", output };
       this.emit({ executionId, context, toolName, type: "tool.executed" });
@@ -127,7 +132,7 @@ export class ToolExecutor {
   private readonly attempts = new Map<string, number>();
 
   private publicError(error: unknown): string {
-    if (error instanceof AuthorizationError || error instanceof ValidationError || error instanceof ToolNotFoundError || error instanceof IdempotencyKeyError || error instanceof RateLimitError || error instanceof CircuitBreakerOpenError) return error.message;
+    if (error instanceof AuthorizationError || error instanceof ValidationError || error instanceof ToolNotFoundError || error instanceof IdempotencyKeyError || error instanceof RateLimitError || error instanceof CircuitBreakerOpenError || error instanceof ResourceLimitError) return error.message;
     return error instanceof Error ? error.message : "Unknown execution error";
   }
 
