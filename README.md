@@ -8,108 +8,99 @@ A production-oriented TypeScript engineering sample demonstrating how an AI appl
 
 When an AI agent can do more than generate text, the application needs a reliable execution boundary between **what the model wants to do** and **what the platform is actually allowed to do**.
 
-This sample focuses on that boundary: typed tools, tenant isolation, explicit permissions, input validation, idempotency, integration adapters, resilience controls, tenant rate limiting, circuit breaking, structured audit events, metrics, request authentication, replay protection, resource governance, distributed execution coordination, and automated verification.
+This sample demonstrates that boundary with typed tools, tenant isolation, policy-based authorization, input validation, idempotency, provider adapters, resilience, rate limiting, circuit breaking, resource governance, distributed coordination, request authentication, replay protection, structured audit events, metrics, operational health checks, and automated verification.
 
 ## Architecture
 
 ```text
- AI / Application Layer
-          |
-          v
- +-------------------+
- |    Tool Registry  |
- +---------+---------+
-           |
-           v
- +-------------------+       +------------------+
- |   Tool Executor   |------>| Audit Sink       |
- +---------+---------+       +------------------+
-           |
-     +-----+------+--------------------------------------+
-     |            |             |         |        |      |
-     v            v             v         v        v      v
- Permissions   Rate Limit   Resilience  Circuit  Resource Distributed
- + Policy      per Tenant   Timeout/Retry Breaker Governance Execution
-     |            |             |         |       limits   Coordination
-     +------------+-------------+---------+---------+---------+
-                              |
-                              v
-                       Input Validation
-                              |
-                              v
-                     Integration Adapter
-                              |
-                              v
-                       External Service
-
-Network / Trust Boundary
-          |
-          v
- +-----------------------+
- | SecureToolExecutor    |
- | HMAC + replay checks  |
- +-----------------------+
+Untrusted / model-derived intent
+              |
+              v
+ +-----------------------------+
+ | SecureToolExecutor          |
+ | HMAC + principal + replay   |
+ +--------------+--------------+
+                |
+                v
+ +-----------------------------+
+ | ToolExecutor                |
+ | execution enforcement       |
+ +--------------+--------------+
+                |
+      +---------+----------+--------------------+
+      |                    |                    |
+      v                    v                    v
+ Authorization       Execution controls    Observability
+ tenant / policy     rate / idempotency    audit / metrics
+ RBAC-style          retry / circuit       security events
+ server-derived     resource / budget     readiness
+ permissions         distributed claims
+      |                    |
+      +----------+---------+
+                 |
+                 v
+          +--------------+
+          | Tool Registry |
+          +------+-------+
+                 |
+                 v
+          +--------------+
+          | Typed Tool    |
+          | validation    |
+          +------+-------+
+                 |
+                 v
+          Integration Adapter
+                 |
+                 v
+          External Provider
 ```
 
-The executor is the enforcement boundary. Tool definitions declare their required permissions, but the caller does not get to bypass the executor by invoking an adapter directly through the normal execution path.
+The executor is the enforcement boundary. Tool definitions declare their required permissions, while trusted network-facing code can derive identity and permissions from the authenticated credential rather than accepting them from the caller.
 
-## Design principles
+For the detailed lifecycle and invariants, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-### 1. Tenant isolation
+## Security principles
 
-Every execution carries an explicit `tenantId` and `actorId`. Idempotency keys are namespaced by tenant, the example calendar adapter stores events under the current tenant, and rate limits are also tenant-scoped.
+### Tenant isolation
 
-### 2. Explicit permissions
+Every execution carries an explicit tenant and actor identity. Idempotency keys and distributed execution claims are tenant-scoped, and the example calendar adapter stores events under the current tenant.
 
-Tools declare permissions such as `calendar.read` and `calendar.write`. Authorization happens before input validation or external execution.
+### Identity and authorization separation
 
-### 3. Typed tool contracts
+At a trusted security boundary, an authenticated credential resolves to a principal. Permissions are then derived server-side from roles/attributes and evaluated by a policy. The caller does not get to grant itself permissions by editing the request context.
 
-Tools expose a typed input validator and typed output contract while the executor remains independent of any specific LLM provider. Tool execution also accepts an optional `AbortSignal` so integrations can cooperate with cancellation.
+### Deny by default
 
-### 4. Strict boundary validation
+Missing tenant/actor identity, missing permissions, invalid credentials, failed policy evaluation, and replay detection stop execution before provider work.
 
-The calendar tool accepts only plain objects, trims titles, enforces a maximum title length, requires UTC ISO-8601 timestamps, and verifies that the end time follows the start time.
+### Provider isolation
 
-### 5. Provider isolation
+External services are represented through integration adapters. Tool contracts do not contain provider-specific credentials or HTTP implementation details.
 
-External services are represented through integration adapters. The tool layer does not contain provider-specific credentials or HTTP details.
+### Idempotent execution
 
-### 6. Idempotent execution
+Successful results are cached by tenant-scoped idempotency keys. Concurrent local requests are coalesced. When a distributed store is configured, an atomic claim coordinates workers so only one worker owns the execution while others wait for its result.
 
-Successful results are cached by a tenant-scoped idempotency key. Concurrent requests with the same key are coalesced so they do not race into duplicate provider calls. The executor depends on an `IdempotencyStore` abstraction, allowing a production deployment to replace the in-memory implementation with a durable store. Failed and denied executions are not persisted as successful work.
+### Resilience
 
-### 7. Resilience at the provider boundary
+Provider operations can use bounded timeouts, cancellation, exponential-backoff retries, explicit retry classification, and a per-tool circuit breaker. Authorization, validation, resource-limit, and circuit-admission failures are not counted as provider health failures.
 
-Provider operations can be protected with bounded timeouts and exponential-backoff retries. Authorization, validation, and timeout errors are not retried by default. A `shouldRetry` policy hook allows provider-specific classification when a production integration knows which errors are transient. Timeout handling aborts the execution signal so cooperative adapters can stop work rather than merely timing out the caller.
+### Resource governance
 
-### 8. Circuit breaking
+Maximum serialized input/output sizes and an execution-time budget can be enforced. Resource budgets propagate cancellation through `AbortSignal`.
 
-A per-tool circuit breaker prevents repeated calls to a failing provider after a configurable failure threshold. After a reset interval, one half-open probe is allowed to test recovery. Successful execution closes the circuit; denied policy failures do not count as provider failures.
+### Observability without payload leakage
 
-### 9. Tenant rate limiting
+Audit events contain execution metadata rather than raw tool inputs or customer payloads. Metrics record tool, outcome, duration, and the actual retry attempt count.
 
-A lightweight token-window limiter can cap execution requests per tenant. The executor depends on a `RateLimiter` abstraction so production deployments can replace the in-memory implementation with a distributed implementation without changing tool contracts.
+### Network authentication and replay protection
 
-### 10. Observability without data leakage
+`SecureToolExecutor` supports HMAC-SHA256 signatures, bounded timestamp skew, nonce validation, constant-time signature comparison, pluggable secret resolution, trusted principal resolution, policy evaluation, and replay protection.
 
-The executor emits structured lifecycle events containing execution metadata rather than raw inputs or customer payloads. A metrics sink records tool, outcome, duration, and the **actual number of attempts**, rather than only the configured retry budget.
+### Operational controls
 
-### 11. Request authentication and replay protection
-
-Requests crossing a network or trust boundary can be wrapped by `SecureToolExecutor`. The sample supports HMAC-SHA256 request signatures, bounded timestamp skew, nonce validation, constant-time signature comparison, pluggable secret resolution, and tenant-scoped replay protection. Authentication failures are rejected before the underlying tool executor runs.
-
-### 12. Resource governance
-
-The executor can enforce maximum serialized input and output sizes and a separate execution-time budget. Input limits are checked before provider execution; output limits are checked before a result is accepted; execution budgets propagate cancellation through `AbortSignal`, including when normal retry/timeout resilience is also configured.
-
-### 13. Distributed execution coordination
-
-An optional `DistributedExecutionStore` moves idempotency coordination outside a single application process. An atomic `claim()` ensures that only one worker owns a given tenant-scoped execution key at a time. Other workers wait for the shared execution to complete and reuse the successful result instead of making another provider call. Failed work releases its claim so a later worker can retry.
-
-The included in-memory implementation is deliberately a reference adapter: separate `ToolExecutor` instances can share the same store to demonstrate cross-worker coordination. A production implementation should map the same contract to durable storage with an atomic claim operation, durable result retention, lease/ownership expiry, and safe recovery from worker crashes.
-
-The sample keeps state in memory deliberately. Production deployments should use durable idempotency/execution storage, distributed rate limiting/coordination, durable telemetry infrastructure, and shared replay-protection state.
+The operational layer provides a stable failure taxonomy, correlated security-event envelopes, and readiness checks. These are intentionally exposed as small interfaces so a production service can connect them to its telemetry and health infrastructure.
 
 ## Included tools
 
@@ -118,51 +109,55 @@ The sample keeps state in memory deliberately. Production deployments should use
 | `calendar.create_event` | `calendar.write` | Creates an event for the current tenant |
 | `calendar.list_events` | `calendar.read` | Lists events for the current tenant |
 
-The second tool is intentionally read-only. It demonstrates that permissions are part of the tool contract rather than a convention hidden inside an integration implementation.
+The read tool is intentionally read-only, demonstrating that permissions are part of the tool contract rather than a convention hidden inside the integration implementation.
 
-## Example execution flow
+## Execution flow
 
-1. Network-facing code authenticates the request and checks replay protection.
-2. Executor validates tenant and actor context.
-3. A tenant-scoped idempotency replay is resolved before consuming a new rate-limit slot.
-4. If configured, a distributed execution store atomically claims the shared execution key.
-5. Executor resolves the tool from the registry.
-6. Executor checks required permissions.
-7. Tool validates untrusted input.
-8. Resource governance checks input limits.
-9. Circuit breaker checks provider health.
-10. Provider execution is protected by resource and optional timeout/retry policy.
-11. Output limits are checked.
-12. A successful result is committed to the shared execution store when distributed coordination is enabled.
-13. A typed result is returned.
-14. Audit events and metrics capture the lifecycle.
+1. Authenticate the request at the network/trust boundary.
+2. Resolve a trusted principal and server-derived permissions when configured.
+3. Evaluate the authorization policy.
+4. Enforce replay protection.
+5. Validate tenant context and idempotency key.
+6. Reuse completed/in-flight idempotent work when available.
+7. Optionally claim the execution atomically across workers.
+8. Enforce the tenant rate limit.
+9. Resolve the tool and check its required permissions.
+10. Validate untrusted tool input.
+11. Enforce input/resource limits and establish an execution budget.
+12. Check circuit-breaker state.
+13. Execute the provider operation with cancellation and optional timeout/retry policy.
+14. Validate output/resource limits.
+15. Persist successful idempotent/distributed results.
+16. Emit audit events and metrics.
 
 ## Project structure
 
 ```text
 src/
 ├── ai/
-│   ├── types.ts                 # Core tool and execution contracts
+│   ├── types.ts                 # Core tool/execution contracts
 │   ├── tool-registry.ts         # Runtime registration and lookup
 │   └── tool-executor.ts         # Enforcement boundary and orchestration
 ├── auth/
-│   └── permissions.ts           # Tenant and permission enforcement
+│   ├── permissions.ts           # Tenant and permission enforcement
+│   └── policy.ts                # Principal, policy and role permission resolution
 ├── core/
 │   ├── errors.ts                # Typed boundary errors
 │   ├── circuit-breaker.ts       # Per-tool provider circuit breaker
 │   ├── distributed-execution.ts # Cross-worker execution coordination
 │   ├── idempotency.ts           # Pluggable local idempotency store
 │   ├── observability.ts         # Metrics sink and in-memory implementation
-│   ├── rate-limiter.ts          # Rate limiter contract + tenant implementation
+│   ├── operational.ts           # Failure taxonomy, security events, readiness
+│   ├── rate-limiter.ts          # Tenant rate limiter
 │   ├── resilience.ts            # Timeout, cancellation and retry policy
-│   └── resource-governance.ts   # Input/output/execution resource limits
+│   └── resource-governance.ts   # Input/output/execution limits
 ├── integrations/
 │   ├── integration.ts           # Provider adapter contract
-│   └── example-calendar.ts      # Provider-free, tenant-scoped adapter
+│   └── example-calendar.ts      # Provider-free tenant-scoped adapter
 ├── security/
-│   ├── request-auth.ts          # HMAC request authentication
+│   ├── request-auth.ts          # HMAC request authentication/principal resolution
 │   ├── replay-protection.ts     # Nonce/replay protection abstraction
-│   └── secure-tool-executor.ts  # Trust-boundary security facade
+│   └── secure-tool-executor.ts  # Trusted security boundary facade
 ├── tools/
 │   ├── create-calendar-event.ts # Typed write tool
 │   └── list-calendar-events.ts  # Typed read tool
@@ -171,50 +166,68 @@ src/
 └── index.ts                     # Small executable example
 
 tests/
-├── tool-executor.test.ts                  # Security, validation and concurrency behaviour
-├── phase3.test.ts                         # Resilience, rate limiting and metrics
-├── phase4.test.ts                         # Retry classification, cancellation and circuit breaking
-├── phase5-security.test.ts                # Authentication and replay protection
-├── phase6-resource-governance.test.ts     # Resource limits and execution budgets
-└── phase7-distributed-execution.test.ts   # Cross-worker claims and provider-call deduplication
+├── tool-executor.test.ts
+├── phase3.test.ts
+├── phase4.test.ts
+├── phase5-security.test.ts
+├── phase6-resource-governance.test.ts
+├── phase7-distributed-execution.test.ts
+├── phase9-operational.test.ts
+└── ...                          # Focused security and execution-boundary tests
+
+docs/
+├── ARCHITECTURE.md              # Detailed architecture and invariants
+└── THREAT-MODEL.md              # Threats, controls and residual risks
+SECURITY.md                       # Security model and reporting guidance
 ```
 
-## Testing
+## Engineering phases
 
-The suite covers authorized execution, permission denial, tenant isolation, strict validation, idempotent replay and concurrency, provider resilience, explicit retry classification, timeout cancellation, tenant rate limiting, circuit breaking, execution metrics with actual retry attempts, HMAC authentication, timestamp/nonce validation, replay attacks, input/output limits, cooperative execution cancellation, atomic distributed claims, cross-worker idempotency, tenant-scoped coordination, claim release, and shared-result waiting.
+- **Phase 1 — Foundation:** typed execution boundary, registry, tenant context, basic permissions.
+- **Phase 2 — Secure correctness:** validation, typed errors, idempotency, second tool, tenant isolation, CI.
+- **Phase 3 — Resilience:** timeout/cancellation, retry policy, rate limiting, metrics.
+- **Phase 4 — Provider protection:** circuit breaker, retry classification, actual attempt tracking.
+- **Phase 5 — Trust boundary:** HMAC authentication and replay protection.
+- **Phase 6 — Resource governance:** input/output limits and execution budgets.
+- **Phase 7 — Distributed execution:** atomic claims, cross-worker coordination, shared-result waiting.
+- **Phase 8 — Policy & authorization:** trusted principals, server-derived permissions, policy evaluation, deny-by-default boundaries.
+- **Phase 9 — Production operations:** failure taxonomy, correlated security events, readiness checks, operational hardening.
+- **Phase 10 — Final engineering hardening:** architecture/threat-model documentation, security policy, regression cleanup, CI/security verification, and portfolio-ready documentation.
 
-## Running locally
+## Testing and verification
 
-Requirements: Node.js 20+.
+Run locally with Node.js 20+:
 
 ```bash
 npm install
 npm test
 npm run typecheck
 npm run build
+npm audit --omit=dev
 ```
 
-CI runs the same typecheck, test, and build commands on pushes and pull requests to `main`.
+CI runs install, production dependency audit, typecheck, tests, and build on pushes and pull requests to `main`.
 
 ## Production considerations
 
-The sample deliberately keeps infrastructure small enough to review. A production implementation would additionally need:
+The sample deliberately keeps infrastructure small enough to review. A production implementation additionally needs:
 
-- durable idempotency and execution storage with retention, conflict semantics, atomic claim operations, and crash recovery
-- short-lived execution leases or fencing tokens so a stalled worker cannot retain ownership forever
-- distributed locking or atomic persistence where provider calls require it
-- provider-call deduplication semantics that match the provider's own idempotency guarantees
-- distributed rate limiting
+- durable idempotency and execution storage with explicit retention and conflict semantics
+- atomic distributed claims with leases/fencing and crash recovery
+- provider-side idempotency/cancellation where external side effects can escape the application transaction
+- distributed rate limiting and tenant quotas
 - shared replay-protection state with atomic nonce claims
-- provider-specific retry classification and circuit-breaker state when multiple application instances are involved
-- durable audit storage and OpenTelemetry/metrics integration
-- secret management, credential rotation and key revocation
-- richer policy evaluation and role/attribute-based authorization
-- server-derived permissions at the authenticated security boundary
-- resource quotas and abuse controls appropriate to each tenant and tool
-- bounded in-memory state, eviction and lifecycle management for local development implementations
+- durable audit/security telemetry and OpenTelemetry-compatible instrumentation
+- managed secrets, key rotation and credential revocation
+- richer RBAC/ABAC policy evaluation and centralized policy lifecycle management
+- bounded in-memory state, eviction and lifecycle management
+- HTTP-edge limits, queue/concurrency controls and abuse prevention
 
-These boundaries are explicit so infrastructure can evolve without coupling provider concerns to the AI/tool contract.
+These are documented as explicit boundaries rather than hidden assumptions. See [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md) for residual risks.
+
+## Security
+
+See [`SECURITY.md`](SECURITY.md) for the security model and reporting guidance.
 
 ## Author
 
