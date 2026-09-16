@@ -14,11 +14,7 @@ import { RateLimitError, TenantRateLimiter } from "../core/rate-limiter.js";
 import { CircuitBreakerOpenError, ToolCircuitBreaker } from "../core/circuit-breaker.js";
 import type { MetricsSink } from "../core/observability.js";
 import { validateIdempotencyKey } from "../validation/calendar.js";
-import type {
-  ExecutionContext,
-  ToolExecutionRequest,
-  ToolExecutionResult,
-} from "./types.js";
+import type { ExecutionContext, ToolExecutionRequest, ToolExecutionResult } from "./types.js";
 import { ToolRegistry } from "./tool-registry.js";
 
 export type AuditEventType =
@@ -38,7 +34,6 @@ export interface AuditEvent {
 }
 
 export type AuditSink = (event: AuditEvent) => void;
-
 type ExecutionPromise = Promise<ToolExecutionResult>;
 
 export interface ToolExecutorOptions {
@@ -51,6 +46,7 @@ export interface ToolExecutorOptions {
 export class ToolExecutor {
   private readonly completed = new Map<string, ToolExecutionResult>();
   private readonly inFlight = new Map<string, ExecutionPromise>();
+  private readonly lastAttempts = new Map<string, number>();
 
   constructor(
     private readonly registry: ToolRegistry,
@@ -58,23 +54,18 @@ export class ToolExecutor {
     private readonly options: ToolExecutorOptions = {},
   ) {}
 
-  async execute<TOutput = unknown>(
-    request: ToolExecutionRequest,
-  ): Promise<ToolExecutionResult<TOutput>> {
+  async execute<TOutput = unknown>(request: ToolExecutionRequest): Promise<ToolExecutionResult<TOutput>> {
     const executionId = randomUUID();
     const startedAt = Date.now();
 
     try {
       assertTenantContext(request.context);
       const idempotencyKey = validateIdempotencyKey(request.idempotencyKey);
-      const cacheKey = idempotencyKey
-        ? this.cacheKey(request.context.tenantId, idempotencyKey)
-        : undefined;
+      const cacheKey = idempotencyKey ? this.cacheKey(request.context.tenantId, idempotencyKey) : undefined;
 
       if (cacheKey) {
         const completed = this.completed.get(cacheKey);
         if (completed) return completed as ToolExecutionResult<TOutput>;
-
         const inFlight = this.inFlight.get(cacheKey);
         if (inFlight) return (await inFlight) as ToolExecutionResult<TOutput>;
       }
@@ -85,7 +76,7 @@ export class ToolExecutor {
       const execution = this.executeOnce(request, executionId);
       if (!cacheKey) {
         const result = await execution;
-        this.recordMetric(request.toolName, result.status, startedAt);
+        this.recordMetric(request.toolName, result.status, startedAt, executionId);
         return result as ToolExecutionResult<TOutput>;
       }
 
@@ -93,14 +84,14 @@ export class ToolExecutor {
       try {
         const result = await execution;
         if (result.status === "succeeded") this.completed.set(cacheKey, result);
-        this.recordMetric(request.toolName, result.status, startedAt);
+        this.recordMetric(request.toolName, result.status, startedAt, executionId);
         return result as ToolExecutionResult<TOutput>;
       } finally {
         this.inFlight.delete(cacheKey);
       }
     } catch (error) {
       const status = error instanceof AuthorizationError || error instanceof RateLimitError ? "denied" : "failed";
-      this.recordMetric(request.toolName, status, startedAt, 0);
+      this.recordMetric(request.toolName, status, startedAt, executionId);
       return {
         executionId,
         toolName: request.toolName,
@@ -110,10 +101,7 @@ export class ToolExecutor {
     }
   }
 
-  private async executeOnce(
-    request: ToolExecutionRequest,
-    executionId: string,
-  ): Promise<ToolExecutionResult> {
+  private async executeOnce(request: ToolExecutionRequest, executionId: string): Promise<ToolExecutionResult> {
     const { context, toolName } = request;
     let attempts = 0;
 
@@ -140,22 +128,13 @@ export class ToolExecutor {
       }
 
       this.options.circuitBreaker?.recordSuccess(toolName);
-      const result: ToolExecutionResult = {
-        executionId,
-        toolName,
-        status: "succeeded",
-        output,
-      };
-
+      const result: ToolExecutionResult = { executionId, toolName, status: "succeeded", output };
       this.emit({ executionId, context, toolName, type: "tool.executed" });
       return result;
     } catch (error) {
-      if (!(error instanceof CircuitBreakerOpenError)) {
-        this.options.circuitBreaker?.recordFailure(toolName);
-      }
+      if (!(error instanceof CircuitBreakerOpenError)) this.options.circuitBreaker?.recordFailure(toolName);
       const denied = error instanceof AuthorizationError || error instanceof RateLimitError;
       this.emit({ executionId, context, toolName, type: denied ? "tool.denied" : "tool.failed" });
-
       return {
         executionId,
         toolName,
@@ -167,8 +146,6 @@ export class ToolExecutor {
     }
   }
 
-  private readonly lastAttempts = new Map<string, number>();
-
   private publicError(error: unknown): string {
     if (
       error instanceof AuthorizationError ||
@@ -177,37 +154,21 @@ export class ToolExecutor {
       error instanceof IdempotencyKeyError ||
       error instanceof RateLimitError ||
       error instanceof CircuitBreakerOpenError
-    ) {
-      return error.message;
-    }
+    ) return error.message;
     return error instanceof Error ? error.message : "Unknown execution error";
   }
 
-  private recordMetric(
-    toolName: string,
-    status: ToolExecutionResult["status"],
-    startedAt: number,
-    fallbackAttempts?: number,
-  ): void {
-    const attempts = fallbackAttempts ?? [...this.lastAttempts.values()].at(-1) ?? 1;
-    this.options.metrics?.record({
-      toolName,
-      status,
-      durationMs: Date.now() - startedAt,
-      attemptCount: attempts,
-    });
+  private recordMetric(toolName: string, status: ToolExecutionResult["status"], startedAt: number, executionId: string): void {
+    const attempts = this.lastAttempts.get(executionId) ?? 1;
+    this.options.metrics?.record({ toolName, status, durationMs: Date.now() - startedAt, attemptCount: attempts });
+    this.lastAttempts.delete(executionId);
   }
 
   private cacheKey(tenantId: string, key: string): string {
     return `${tenantId}:${key}`;
   }
 
-  private emit(args: {
-    executionId: string;
-    context: ExecutionContext;
-    toolName: string;
-    type: AuditEventType;
-  }): void {
+  private emit(args: { executionId: string; context: ExecutionContext; toolName: string; type: AuditEventType }): void {
     this.audit({
       executionId: args.executionId,
       tenantId: args.context.tenantId,
