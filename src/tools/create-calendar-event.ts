@@ -14,6 +14,6 @@ export function createCalendarEventTool(
     description: "Create a calendar event for the current tenant.",
     requiredPermissions: ["calendar.write"],
     validateInput: validateCalendarEvent,
-    execute: (input, context) => adapter.execute("create-event", input, context) as Promise<CalendarEventRecord>,
+    execute: (input, context, signal) => adapter.execute("create-event", input, context, signal) as Promise<CalendarEventRecord>,
   };
 }
